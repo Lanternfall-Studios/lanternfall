@@ -22,6 +22,15 @@ module adds:
 * :func:`score_agent` — runs a candidate agent across many seeds and
   reports per-seed results plus aggregates, so models (and policies)
   can be compared on identical worlds.
+* Identity and model provenance (Chris's constraint, Oct 31): every
+  trace entry is stamped with the server-assigned agent identity
+  (persistent id, owning tenant, persona — never client-claimed) and
+  with the model provenance in force at that tick (provider, model
+  name, exact version/snapshot, system-prompt hash, tool set). A model
+  swap is never silent: :meth:`ModelAgent.change_model` records a
+  ``model_change`` chapter in the trace, so any action can be traced
+  to agent + model + version + entitlement. The harness assigns the
+  identity; a driver never supplies its own.
 
 Reply format a driver is expected to emit::
 
@@ -35,9 +44,71 @@ Verbs: move <zone> | gather | craft <recipe> | bid <item> <price> <qty>
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import dataclass, field
 
 from .agents import Agent
+
+
+@dataclass(frozen=True)
+class AgentIdentity:
+    """Server-assigned identity for one agent.
+
+    ``agent_id`` is persistent across seeds and runs; ``tenant`` is the
+    owning tenant (the entitlement the agent runs under); ``persona``
+    is the display persona. The harness assigns this — a driver that
+    claims its own identity is ignored, because client-claimed identity
+    is exactly what provenance exists to prevent.
+    """
+
+    agent_id: str
+    tenant: str = "lanternfall-local"
+    persona: str = ""
+
+    def to_dict(self) -> dict:
+        return {"agent_id": self.agent_id, "tenant": self.tenant,
+                "persona": self.persona or self.agent_id}
+
+
+@dataclass(frozen=True)
+class ModelProvenance:
+    """What model was behind an agent at a given tick.
+
+    ``version`` is the exact version/snapshot string. ``system_prompt``
+    is the full system prompt text; only its SHA-256 hash is stored, so
+    the ledger records which prompt was in force without embedding it.
+    ``tool_set`` is the tool set the model was allowed.
+    """
+
+    provider: str
+    model_name: str
+    version: str
+    system_prompt: str | None = None
+    tool_set: tuple = ()
+
+    @property
+    def system_prompt_hash(self) -> str | None:
+        if self.system_prompt is None:
+            return None
+        return hashlib.sha256(self.system_prompt.encode()).hexdigest()
+
+    def to_dict(self) -> dict:
+        return {"provider": self.provider, "model_name": self.model_name,
+                "version": self.version,
+                "system_prompt_hash": self.system_prompt_hash,
+                "tool_set": list(self.tool_set)}
+
+
+# The reference agent has no model behind it; its provenance says so
+# plainly instead of borrowing a model name it never ran.
+REFERENCE_PROVENANCE = ModelProvenance(
+    provider="none", model_name="scripted-reference", version="1",
+    tool_set=("scripted-policy",))
+
+
+def _identity_for(name: str, identity: AgentIdentity | None) -> AgentIdentity:
+    return identity or AgentIdentity(agent_id=name, persona=name)
 
 
 class ModelDriver:
@@ -103,25 +174,59 @@ def parse_action(text: str, view: dict) -> tuple[tuple, bool, str]:
 
 
 class ModelAgent(Agent):
-    """An agent driven by an injected ModelDriver, with a trace."""
+    """An agent driven by an injected ModelDriver, with a trace.
 
-    def __init__(self, name: str, driver: ModelDriver):
+    Every trace entry carries the agent identity and the model
+    provenance in force at that tick. ``provenance`` is supplied by the
+    caller (the harness/server side); omitting it records the model
+    explicitly as ``unspecified`` — visible, never anonymous.
+    """
+
+    def __init__(self, name: str, driver: ModelDriver,
+                 identity: AgentIdentity | None = None,
+                 provenance: ModelProvenance | None = None):
         super().__init__(name)
         self.driver = driver
+        self.identity = _identity_for(name, identity)
+        self.provenance = provenance or ModelProvenance(
+            provider="unspecified", model_name="unspecified",
+            version="unspecified")
         self.trace: list[dict] = []
+
+    def _stamp(self, entry: dict) -> dict:
+        entry["agent_id"] = self.identity.agent_id
+        entry["tenant"] = self.identity.tenant
+        entry["persona"] = self.identity.persona or self.name
+        entry["model"] = self.provenance.to_dict()
+        return entry
+
+    def change_model(self, new_provenance: ModelProvenance) -> None:
+        """Record a model swap as a new chapter, never a silent swap.
+
+        The chapter entry names the previous and the new model; every
+        trace entry after it is stamped with the new provenance.
+        """
+        old = self.provenance
+        self.provenance = new_provenance
+        self.trace.append(self._stamp({
+            "kind": "model_change", "reasoning": "model change recorded",
+            "raw": "", "action": ("idle",), "parsed_ok": True,
+            "previous_model": old.to_dict()}))
 
     def decide(self, view: dict) -> tuple:
         view_json = json.dumps(view, default=str)
         try:
             text = self.driver.complete(view_json)
         except Exception as exc:  # a driver must never crash the world
-            self.trace.append({"reasoning": "", "raw": "",
-                               "action": ("idle",), "parsed_ok": False,
-                               "error": str(exc)})
+            self.trace.append(self._stamp(
+                {"reasoning": "", "raw": "",
+                 "action": ("idle",), "parsed_ok": False,
+                 "error": str(exc)}))
             return ("idle",)
         action, ok, reasoning = parse_action(text, view)
-        self.trace.append({"reasoning": reasoning, "raw": text,
-                           "action": action, "parsed_ok": ok})
+        self.trace.append(self._stamp(
+            {"reasoning": reasoning, "raw": text,
+             "action": action, "parsed_ok": ok}))
         return action
 
 
@@ -159,9 +264,15 @@ class ReasoningAgent(Agent):
     to end on behavior already known to play sensibly.
     """
 
-    def __init__(self, inner: Agent):
+    def __init__(self, inner: Agent,
+                 identity: AgentIdentity | None = None):
         super().__init__(inner.name)
         self.inner = inner
+        self.identity = _identity_for(inner.name, identity)
+        # Fixed reference provenance: this agent has no model, and its
+        # trace says so on every entry. A model swap on a reference
+        # agent would be a different agent, not a chapter.
+        self.provenance = REFERENCE_PROVENANCE
         self.trace: list[dict] = []
 
     def decide(self, view: dict) -> tuple:
@@ -171,7 +282,11 @@ class ReasoningAgent(Agent):
                            "raw": f"REASONING: {reason}\nACTION: "
                                   f"{action[0]}"
                                   f"{' ' + ' '.join(str(a) for a in action[1:]) if len(action) > 1 else ''}",
-                           "action": action, "parsed_ok": True})
+                           "action": action, "parsed_ok": True,
+                           "agent_id": self.identity.agent_id,
+                           "tenant": self.identity.tenant,
+                           "persona": self.identity.persona or self.name,
+                           "model": self.provenance.to_dict()})
         return action
 
 
@@ -196,8 +311,14 @@ def score_agent(factory, seeds, ticks: int = 300) -> dict:
         summary = result.summary()
         row = next(r for r in summary["leaderboard"] if r["name"] == "Grinder")
         trace = getattr(candidate, "trace", [])
+        identity = getattr(candidate, "identity", None)
+        provenance = getattr(candidate, "provenance", None)
         rows.append({
             "seed": seed,
+            "agent_id": identity.agent_id if identity else "Grinder",
+            "model": provenance.to_dict() if provenance else None,
+            "model_changes": sum(1 for t in trace
+                                 if t.get("kind") == "model_change"),
             "sparks": row["sparks"],
             "total_level": row["total_level"],
             "quests_done": row["quests_done"],
@@ -219,5 +340,12 @@ def score_agent(factory, seeds, ticks: int = 300) -> dict:
                      "peak_xp_rate_10t", "market_trades")}
     agg["total_parse_failures"] = sum(r["parse_failures"] for r in rows)
     agg["total_invalid_actions"] = sum(r["invalid_actions"] for r in rows)
+    identity_block = None
+    if rows:
+        identity_block = {"agent_id": rows[0]["agent_id"],
+                          "model": rows[0]["model"],
+                          "model_changes": sum(r["model_changes"]
+                                               for r in rows)}
     return {"candidate": "Grinder-slot", "ticks": ticks,
+            "identity": identity_block,
             "seeds": rows, "aggregate": agg}

@@ -208,6 +208,13 @@ copied from QuestBench's or rs-sdk's code.
 2. ~~**A commons scenario with a visible shared-stock meter**~~ — done:
    per-tick `commons_history`, `depleted_tick` / `min_stock` in the
    summary, and a live meter + stock chart on the dashboard.
+2a. ~~**Identity + model provenance on harness trajectories**~~ —
+   done (Chris's constraint, Oct 31): every trace entry is stamped
+   with the server-assigned agent identity (persistent id, tenant,
+   persona) and the model provenance in force (provider, model name,
+   exact version, system-prompt hash, tool set); a model swap records
+   a `model_change` chapter, never a silent swap. The reference agent's
+   provenance plainly says provider `none`, model `scripted-reference`.
 3. ~~**Make the economy bite**~~ — done: bigger bankrolls, repriced
    crafted goods, toll actually collects, price-history chart live.
 4. ~~**Grow the generator + second co-op scenario**~~ — done: 3 new
@@ -244,7 +251,11 @@ Replies are parsed by `parse_action` into validated action tuples;
 anything unusable becomes `("idle",)` and is counted, never fatal.
 `ReasoningAgent` wraps a scripted policy and emits a reasoning trace
 per action, so the harness is verifiable with no model attached.
-Score a candidate across seeds (it takes the Grinder slot):
+Every trace entry carries identity + model provenance (see
+`AgentIdentity` / `ModelProvenance` in `model_agent.py`); a model swap
+goes through `ModelAgent.change_model`, which records a `model_change`
+chapter in the trace. Score a candidate across seeds (it takes the
+Grinder slot):
 
 ```
 python3 run.py --score 42,7,123 --score-ticks 300
