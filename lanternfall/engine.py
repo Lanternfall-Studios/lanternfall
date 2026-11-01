@@ -140,14 +140,20 @@ class Engine:
                     self.quests.note_craft(w, player, action[1])
             elif kind == "bid":
                 _i, item, price, qty = action
-                if player.sparks < price * qty:
+                if qty <= 0 or price < 0:
+                    w.log("invalid", player=player.name, action=action,
+                          reason="non-positive quantity or negative price")
+                elif player.sparks < price * qty:
                     w.log("invalid", player=player.name, action=action,
                           reason="cannot afford bid")
                 else:
                     w.post_order(player, "bid", item, price, qty)
             elif kind == "ask":
                 _i, item, price, qty = action
-                if not player.has(item, qty):
+                if qty <= 0 or price < 0:
+                    w.log("invalid", player=player.name, action=action,
+                          reason="non-positive quantity or negative price")
+                elif not player.has(item, qty):
                     w.log("invalid", player=player.name, action=action,
                           reason="does not own asked items")
                 else:

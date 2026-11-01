@@ -106,6 +106,44 @@ def test_scam_avoided():
     print("SCAM-AVOID OK: avoided =", vic_player.scams_avoided)
 
 
+def test_negative_quantities():
+    """Wickwright's mint bug (Nov 1): a negative quantity must never
+    mint items, pass an ownership gate, or reach the order book."""
+    from lanternfall.world import World
+    from lanternfall.model_agent import parse_action
+
+    world = World(seed=7)
+    p = world.add_player("Eve")
+    p.add("ember", 2)
+    assert not p.has("ember", -3), "has() passed a negative quantity"
+    assert not p.has("ember", 0), "has() passed a zero quantity"
+    assert not p.take("ember", -3), "take() accepted a negative quantity"
+    assert p.inventory.get("ember") == 2, "negative take changed inventory"
+    try:
+        p.add("ember", -1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("add() accepted a negative quantity")
+    for side, price, qty in (("ask", 5, -3), ("bid", 5, -3),
+                             ("ask", -5, 3), ("bid", 5, 0)):
+        try:
+            world.post_order(p, side, "ember", price, qty)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"post_order accepted {side} {price}x{qty}")
+    assert p.inventory.get("ember") == 2, "rejected order changed inventory"
+    assert not world.asks and not world.bids, "rejected order reached the book"
+    view = {"items": {"ember": None}}
+    for text in ("ACTION: ask ember 5 -3", "ACTION: bid ember -5 3",
+                 "ACTION: ask ember 5 0"):
+        action, ok, _reason = parse_action(text, view)
+        assert action == ("idle",) and not ok, f"parser accepted {text!r}"
+    print("NEGATIVE-QTY OK: has/take/post_order/parser all reject; "
+          "inventory unchanged at 2 ember")
+
+
 def test_determinism():
     """Same seed -> identical world spec and identical season summary."""
     from lanternfall.generate import generate_world
@@ -143,5 +181,6 @@ def test_worlds_differ():
 if __name__ == "__main__":
     test_season()
     test_scam_avoided()
+    test_negative_quantities()
     test_determinism()
     test_worlds_differ()

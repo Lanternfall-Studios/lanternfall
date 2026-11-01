@@ -82,12 +82,25 @@ class Player:
         return sum(self.level(s) for s in self.xp)
 
     def add(self, item: str, qty: int) -> None:
+        # Negative adds used to mint items through take(): a negative
+        # take subtracts a negative, i.e. adds. Never accept one here.
+        if qty < 0:
+            raise ValueError("cannot add a negative quantity")
+        if qty == 0:
+            return
         self.inventory[item] = self.inventory.get(item, 0) + qty
 
     def has(self, item: str, qty: int = 1) -> bool:
+        # A non-positive quantity is not something a player can "have":
+        # without this, has(item, -3) is True on an empty inventory and
+        # every gate built on has() (ask, propose, respond) passes it.
+        if qty <= 0:
+            return False
         return self.inventory.get(item, 0) >= qty
 
     def take(self, item: str, qty: int) -> bool:
+        if qty <= 0:
+            return False
         if not self.has(item, qty):
             return False
         self.inventory[item] -= qty
@@ -227,6 +240,15 @@ class World:
 
     # ------------------------------------------------------------ market ---
     def post_order(self, player: Player, side: str, item: str, price: int, qty: int) -> Order:
+        # The book must never hold a non-positive quantity or a negative
+        # price: either corrupts matching (min() goes negative, negative
+        # cost pays the buyer) and, for asks, mints via take().
+        if side not in ("bid", "ask"):
+            raise ValueError(f"unknown order side {side!r}")
+        if qty <= 0:
+            raise ValueError(f"order quantity must be positive, got {qty}")
+        if price < 0:
+            raise ValueError(f"order price must not be negative, got {price}")
         order = Order(self.next_order_id, player.name, side, item, price, qty, self.tick)
         self.next_order_id += 1
         if side == "bid":

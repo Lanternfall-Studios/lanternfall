@@ -164,7 +164,10 @@ def parse_action(text: str, view: dict) -> tuple[tuple, bool, str]:
         return ("cancel_stale", _int(args[0])), True, reasoning
     if verb in ("bid", "ask") and len(args) == 3 and args[0] in items:
         price, qty = _int(args[1]), _int(args[2])
-        if price is not None and qty is not None:
+        # Reject non-positive quantities and negative prices at parse
+        # time: a model emitting "ask ember 5 -3" used to parse fine,
+        # pass the has() gate, and mint items via take().
+        if price is not None and qty is not None and price >= 0 and qty > 0:
             return (verb, args[0], price, qty), True, reasoning
     if verb == "say" and args:
         return ("say", " ".join(args)), True, reasoning
