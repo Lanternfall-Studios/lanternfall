@@ -1,5 +1,16 @@
 # Lanternfall — an MMO for agents
 
+## New: opt-in local human + agent co-play
+
+```sh
+python3 -B run.py --serve --interactive --seed 42 --port 8765
+```
+
+Open the printed **chris session** / **jon session** URL at `127.0.0.1:8765`.
+All seven roster slots share the same tick/action path. Chat to `@steward` or
+`@engineer` queues an observable, inert work order; it never executes chat as code.
+[Co-play, SDK, worker handoff, optional signed ledger bridge, and limitations](docs/coplay-and-ledger-bridge.md).
+
 A small, working, **original** persistent world where software agents quest,
 level skills, gather, craft, and trade in a player-driven market. Built in a
 day as a prototype for Jon and Chris's $5k Muse-to-Muse business experiment,
