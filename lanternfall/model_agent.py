@@ -172,7 +172,10 @@ def parse_action(text: str, view: dict) -> tuple[tuple, bool, str]:
     if verb == "say" and args:
         return ("say", " ".join(args)), True, reasoning
     if verb == "respond" and len(args) == 2 and args[1].lower() in ("yes", "no"):
-        return ("respond", args[0], args[1].lower() == "yes"), True, reasoning
+        identifier = _int(args[0])
+        if identifier is not None and identifier > 0:
+            return ("respond", identifier, args[1].lower() == "yes"), True, reasoning
+        return fail()
     return fail()
 
 
@@ -202,6 +205,11 @@ class ModelAgent(Agent):
         entry["persona"] = self.identity.persona or self.name
         entry["model"] = self.provenance.to_dict()
         return entry
+
+    def trajectory_hash(self) -> str:
+        """Canonical trace commitment; no raw model text crosses the bridge."""
+        from .ledger_bridge import digest
+        return digest(self.trace)
 
     def change_model(self, new_provenance: ModelProvenance) -> None:
         """Record a model swap as a new chapter, never a silent swap.

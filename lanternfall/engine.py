@@ -29,9 +29,13 @@ class Engine:
         self.promises: list[dict] = []
         self._processed_events = 0
         self.delivery_templates = delivery_quests(world.spec)
+        self.ledger_bridge = None  # opt-in; standalone simulations do no I/O
+        self._bridge_market_count = 0
+        self._bridge_chapters_hash = None
+        self._bridge_orders_hash = None
 
     # -------------------------------------------------------------- view ---
-    def build_view(self, agent) -> dict:
+    def build_view(self, agent, consume_chat: bool = True) -> dict:
         w = self.world
         player = w.players[agent.name]
         delivery_ready = False
@@ -43,6 +47,9 @@ class Engine:
                     delivery_ready = True
         view = {
             "tick": w.tick,
+            "world_seed": w.spec.seed,
+            "recent_chat": [dict(message, id=index) for index, message in
+                            enumerate(w.chat_log) if index >= len(w.chat_log) - 128],
             "me": {
                 "zone": player.zone,
                 "sparks": player.sparks,
@@ -113,14 +120,24 @@ class Engine:
             ],
             "delivery_ready": delivery_ready,
         }
-        agent.last_chat_tick = w.tick
+        if consume_chat:
+            agent.last_chat_tick = w.tick
         return view
 
     # ------------------------------------------------------------ action ---
     def apply(self, agent, action: tuple) -> None:
         w = self.world
         player = w.players[agent.name]
-        kind = action[0] if action else "idle"
+        from .sdk import validate_action
+        try:
+            action = validate_action(action)
+        except ValueError:
+            w.log("invalid", player=player.name, reason="invalid action shape")
+            return
+        kind = action[0]
+        if kind in {"bid", "ask", "merchant_sell"} and action[1] not in w.spec.items:
+            w.log("invalid", player=player.name, reason="unknown item")
+            return
         try:
             if kind == "move":
                 ok, msg = w.move(player, action[1])
@@ -206,6 +223,27 @@ class Engine:
             w.log("error", player=player.name, action=repr(action), error=str(exc))
 
     # -------------------------------------------------------------- loop ---
+    def step(self) -> "SeasonResult":
+        """One tick through precisely the same path as a headless season."""
+        return self.run(1)
+
+    def _emit_checkpoint(self):
+        if self.ledger_bridge is None:
+            return
+        from .ledger_bridge import checkpoint, digest
+        payload = checkpoint(self)
+        empty = digest({a.name: [] for a in self.agents if hasattr(a, "trace")})
+        if len(self.world.market_history) > self._bridge_market_count:
+            self.ledger_bridge.emit(dict(payload, kind="market_trade"))
+        if payload["model_changes_sha256"] != (self._bridge_chapters_hash or empty):
+            self.ledger_bridge.emit(dict(payload, kind="model_change"))
+        if payload["work_orders_sha256"] != (self._bridge_orders_hash or digest([])):
+            self.ledger_bridge.emit(dict(payload, kind="work_order"))
+        self.ledger_bridge.emit(payload)
+        self._bridge_market_count = len(self.world.market_history)
+        self._bridge_chapters_hash = payload["model_changes_sha256"]
+        self._bridge_orders_hash = payload["work_orders_sha256"]
+
     def run(self, ticks: int, verbose: bool = False) -> "SeasonResult":
         w = self.world
         for _ in range(ticks):
@@ -242,6 +280,7 @@ class Engine:
                  "cap": commons_node.cap})
             for p in w.players.values():
                 p.xp_history.append((w.tick, p.total_xp()))
+            self._emit_checkpoint()
             if verbose and w.tick % 50 == 0:
                 print(f"--- tick {w.tick} ---")
                 for p in w.players.values():
@@ -340,11 +379,12 @@ class SeasonResult:
         summary = self.summary()
         with open(os.path.join(out_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
-        with open(os.path.join(out_dir, "events.jsonl"), "w") as f:
+        from .ledger_bridge import canonical
+        with open(os.path.join(out_dir, "events.jsonl"), "wb") as f:
             for e in self.events:
-                f.write(json.dumps(e) + "\n")
-        with open(os.path.join(out_dir, "world.json"), "w") as f:
-            json.dump(self.world.snapshot(), f, indent=2)
+                f.write(canonical(e) + b"\n")
+        with open(os.path.join(out_dir, "world.json"), "wb") as f:
+            f.write(canonical(self.world.snapshot()))
         return summary
 
 

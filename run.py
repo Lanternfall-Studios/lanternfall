@@ -18,7 +18,56 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lanternfall.demo import build_demo
 from lanternfall.dashboard import serve_in_background
-from lanternfall.engine import default_run_dir
+from lanternfall.engine import default_run_dir, SeasonResult
+from lanternfall.ledger_bridge import LedgerBridge, checkpoint
+
+
+def interactive(args, bridge):
+    from pathlib import Path
+    import tempfile
+    from lanternfall.coplay import build_coplay
+    boundary = Path(__file__).resolve().parent.parent
+    staging = boundary / ".steward-audit" / "work_orders"
+    staging.mkdir(parents=True, exist_ok=True)
+    session = Path(tempfile.mkdtemp(prefix="session-", dir=staging))
+    outbox = Path(args.work_outbox).absolute() if args.work_outbox else session / "outbox"
+    out = Path(args.out).absolute() if args.out else session / "artifacts"
+    # User-selected artifact paths are still constrained to this workspace.
+    relative = out.relative_to(boundary)
+    current = boundary
+    for part in relative.parts:
+        if part == "..":
+            raise ValueError("unsafe artifact directory")
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("artifact symlink forbidden")
+    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    room = build_coplay(args.seed, outbox=outbox, events_path=out / "events.jsonl")
+    room.engine.ledger_bridge = bridge
+    server = serve_in_background(room.engine, args.port, room=room)
+    origin = f"http://127.0.0.1:{server.server_port}"
+    print(f"Interactive dashboard: {origin}/", flush=True)
+    for actor in server.actor_tokens:
+        print(f"{actor} session: {origin}/?actor={actor}#token={server.actor_tokens[actor]}", flush=True)
+    print(f"Outbox: {outbox}\nArtifacts: {out}", flush=True)
+    print("Co-play ready", flush=True)
+    room.start()
+    try:
+        while not room.stopped.wait(1):
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        room.stop()
+        server.shutdown()
+        server.server_close()
+        with room.lock:
+            SeasonResult(room.engine).write(str(out))
+    if room.error:
+        print(room.error, file=sys.stderr)
+        return 1
+    bridge.emit(checkpoint(room.engine, "season"))
+    return 0
 
 
 def print_world(engine) -> None:
@@ -59,6 +108,14 @@ def main() -> int:
     parser.add_argument("--serve", action="store_true",
                         help="serve a live dashboard while the season runs")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--interactive", action="store_true", help="shared-room pulse loop; requires --serve")
+    parser.add_argument("--work-outbox", help="fresh owner-only directory for inert work orders")
+    parser.add_argument("--ledger-bridge", default=os.environ.get("LANTERNFALL_LEDGER_BRIDGE"),
+                        metavar="VERIFIER", help="opt-in trusted Cradle verifier.sh path")
+    parser.add_argument("--bridge-key", default=os.environ.get("LANTERNFALL_BRIDGE_KEY"),
+                        help="external owner-only enrolled signing key; never stored in source")
+    parser.add_argument("--bridge-actor", default=os.environ.get("LANTERNFALL_BRIDGE_ACTOR"),
+                        help="enrolled Cradle actor id")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--out", default=None, help="run artifact directory")
     parser.add_argument("--world", action="store_true",
@@ -68,6 +125,13 @@ def main() -> int:
                              "comma-separated seeds, e.g. --score 42,7,123")
     parser.add_argument("--score-ticks", type=int, default=300)
     args = parser.parse_args()
+    if args.interactive and (not args.serve or args.score or args.world):
+        parser.error("--interactive requires --serve and cannot combine with --world/--score")
+    if not 0 <= args.seed <= 2**53:
+        parser.error("seed must be an integer in [0, 2**53]")
+    bridge = LedgerBridge(args.ledger_bridge, args.bridge_key, args.bridge_actor)
+    if args.interactive:
+        return interactive(args, bridge)
 
     if args.score:
         from lanternfall.agents import Grinder
@@ -88,6 +152,8 @@ def main() -> int:
         return 0
 
     engine = build_demo(seed=args.seed)
+    if args.ledger_bridge:
+        engine.ledger_bridge = bridge
     if args.world:
         print_world(engine)
         return 0
@@ -99,6 +165,7 @@ def main() -> int:
     result = engine.run(args.ticks, verbose=args.verbose)
     out_dir = args.out or default_run_dir()
     summary = result.write(out_dir)
+    bridge.emit(checkpoint(engine, "season"))
 
     print(f"\n== Lanternfall season complete: {args.ticks} ticks, seed {args.seed} ==")
     print(f"Artifacts: {out_dir}/summary.json, events.jsonl, world.json")
